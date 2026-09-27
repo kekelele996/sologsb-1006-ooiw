@@ -2,12 +2,14 @@
   import { onMount } from 'svelte'
   import Button from 'flowbite-svelte/Button.svelte'
   import {
-    acknowledgeReminder, addAnnouncement, addSession, addSpeaker, addTerm, canRedo, canUndo, clearDuplicate,
-    deleteCue, desk, getDelay, ingestCue, moveCue, publishAnnouncement, redoDesk, sendReminder, setActiveCue,
-    setCueStatus, setFontScale, setLiveSimulation, setOnline, speakerName, termTarget, undoDesk, updateCue,
-    updateSession, updateSpeaker, updateTerm
+    acknowledgeReminder, addAnnouncement, addBreakSession, addSession, addSpeaker, addTerm, canRedo, canUndo,
+    clearDuplicate, collisionMinutes, deleteCue, desk, findAdjustment, getDelay, ingestCue, liveDelta, liveEnd,
+    liveStart, moveCue, publishAnnouncement, redoDesk, resetSchedule, sendReminder,
+    setActiveCue, setCueStatus, setFontScale, setLiveSimulation, setOnline, signDelta, sortedSessions, speakerName,
+    termTarget, undoDesk, updateCue, updateSpeaker, updateTerm
   } from '$lib/store'
-  import type { Announcement, Cue, Session, TabId, Term } from '$lib/types'
+  import ScheduleRow from '$lib/ScheduleRow.svelte'
+  import type { Announcement, Cue, ScheduleAdjustment, TabId, Term } from '$lib/types'
 
   const liveLines = [
     'Cooling corridors can connect parks, schools, and shaded transit stops.',
@@ -29,8 +31,13 @@
   let manualInput: HTMLTextAreaElement
   let simulationIndex = 0
   let showHelp = false
+  let selectedAdjustmentId: string | null = null
 
+  $: orderedSessions = sortedSessions($desk)
   $: currentSession = $desk.sessions.find(item => item.status === 'live') || $desk.sessions[0]
+  $: liveTimeline = orderedSessions.filter(item => item.status !== 'done')
+  $: selectedAdjustment = findAdjustment($desk, selectedAdjustmentId)
+  $: latestAdjustment = $desk.adjustments[0]
   $: activeCue = $desk.cues.find(item => item.id === $desk.activeCueId) || $desk.cues.at(-1)
   $: pendingCount = $desk.cues.filter(item => item.status === 'pending').length
   $: offlineCount = $desk.cues.filter(item => item.offline).length
@@ -66,6 +73,23 @@
   function flash(message: string) {
     notice = message
     window.setTimeout(() => { if (notice === message) notice = '' }, 2800)
+  }
+  function sessionTitle(id: string | null | undefined): string {
+    if (!id) return '—'
+    return $desk.sessions.find(item => item.id === id)?.title || '—'
+  }
+  function adjustmentNumber(item: ScheduleAdjustment): number {
+    return $desk.adjustments.findIndex(row => row.id === item.id) + 1
+  }
+  function adjustmentTime(item: ScheduleAdjustment): string {
+    return new Date(item.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })
+  }
+  function onRegistered(event: CustomEvent<{ id: string | null }>) {
+    // recordSessionEnd 会把新记录插到最前；选中本次调整以便沿同一条批次查看
+    selectedAdjustmentId = event.detail.id ?? null
+    const fresh = findAdjustment($desk, selectedAdjustmentId)
+    if (fresh?.blockerSessionId) flash('已重排到锁定点：后续场次保留原计划并标为被挡。')
+    else flash('后续未开始场次已按实际结束时刻重排。')
   }
   function selectCue(cue: Cue) {
     setActiveCue(cue.id)
@@ -176,7 +200,10 @@
         <div>
           <p class="text-[10px] font-black uppercase tracking-[.18em] text-teal-700">当前场次 · {$desk.online ? 'LIVE' : 'OFFLINE MODE'}</p>
           <h1 class="mt-1 text-2xl font-black tracking-tight lg:text-4xl">{currentSession?.title}</h1>
-          <p class="mt-2 text-sm text-slate-500">{currentSession?.time} · {currentSession?.room} · {$desk.speakers.find(item => item.id === currentSession?.speakerId)?.name}</p>
+          <p class="mt-2 text-sm text-slate-500">
+            {#if currentSession?.liveTime}<span class="font-black text-teal-800">现场 {liveStart(currentSession)}</span><span class="mx-1 text-slate-300">（原计划 {currentSession.time}{liveDelta(currentSession) !== 0 ? ` · ${signDelta(liveDelta(currentSession))}′` : ''}）</span>{:else}{currentSession?.time}{/if}
+            · {currentSession?.room} · {$desk.speakers.find(item => item.id === currentSession?.speakerId)?.name}
+          </p>
         </div>
         <div class="grid grid-cols-3 gap-2 text-center">
           <div class="rounded-xl border bg-white px-4 py-2"><strong class="block text-xl">{pendingCount}</strong><span class="text-[10px] text-slate-500">待传</span></div>
@@ -184,6 +211,56 @@
           <div class="rounded-xl border bg-white px-4 py-2"><strong class="block text-xl text-red-700">{duplicateCount}</strong><span class="text-[10px] text-slate-500">疑似重复</span></div>
         </div>
       </div>
+
+      <section class="mb-4 rounded-2xl border bg-white p-3 shadow-sm">
+        <div class="mb-2 flex flex-wrap items-center justify-between gap-2 px-1">
+          <h2 class="text-xs font-black uppercase tracking-[.16em] text-slate-400">现场日程 · 原计划为对照</h2>
+          {#if latestAdjustment}
+            <span class="text-[11px] font-bold text-slate-500">
+              最近调整 #{adjustmentNumber(latestAdjustment)} · {adjustmentTime(latestAdjustment)} 登记「{sessionTitle(latestAdjustment.sourceSessionId)}」实际结束 {latestAdjustment.actualEnd}
+              {#if latestAdjustment.blockerSessionId}· 停在「{sessionTitle(latestAdjustment.blockerSessionId)}」{/if}
+            </span>
+          {/if}
+        </div>
+        <ol class="flex gap-2 overflow-x-auto pb-2 scrollbar-thin">
+          {#each liveTimeline as session, index}
+            {@const delta = liveDelta(session)}
+            {@const adj = findAdjustment($desk, session.adjustmentId)}
+            {@const blocker = adj ? $desk.sessions.find(item => item.id === adj.blockerSessionId) : undefined}
+            {@const overlap = adj && blocker ? collisionMinutes(session, blocker) : 0}
+            <li
+              class="min-w-[168px] shrink-0 rounded-xl border p-2.5 {session.status === 'live' ? 'border-teal-600 bg-teal-50' : session.locked ? 'border-indigo-400 bg-indigo-50/60' : session.blockedById ? 'border-amber-300 bg-amber-50' : ''}"
+            >
+              <div class="flex items-center justify-between text-[10px] font-black">
+                <span class="text-slate-400">#{orderedSessions.findIndex(item => item.id === session.id) + 1}</span>
+                {#if session.status === 'live'}<span class="rounded bg-red-600 px-1.5 py-0.5 text-white">进行中</span>{/if}
+                {#if session.locked}<span class="rounded bg-indigo-600 px-1.5 py-0.5 text-white">🔒 锁定</span>{/if}
+                {#if session.blockedById}<span class="rounded bg-amber-500 px-1.5 py-0.5 text-white">被挡</span>{/if}
+              </div>
+              <p class="mt-1 truncate text-xs font-black" title={session.title}>{session.title}</p>
+              <div class="mt-1.5 text-xs">
+                {#if session.liveTime}
+                  <strong class="text-teal-800">{liveStart(session)}</strong>
+                  {#if delta !== 0}<span class="ml-1 font-black {delta > 0 ? 'text-red-600' : 'text-emerald-600'}">{signDelta(delta)}′</span>{/if}
+                {:else}
+                  <strong>{session.time}</strong>
+                {/if}
+                <span class="text-[10px] text-slate-400">– {liveEnd(session)}</span>
+              </div>
+              <div class="mt-0.5 text-[10px] text-slate-400">
+                {#if session.liveTime}原计划 {session.time}{:else if session.blockedById}原计划保留{:else}按原计划{/if}
+              </div>
+              {#if overlap > 0}<div class="mt-1 rounded bg-red-600 px-1.5 py-0.5 text-[10px] font-black text-white">⚠ 越过锁定 {overlap}′</div>{/if}
+              {#if index === liveTimeline.length - 1 && !session.blockedById && !session.locked}<div class="mt-1 text-[10px] text-slate-400">{session.plannedMinutes}′ 计划时长</div>{/if}
+            </li>
+          {/each}
+        </ol>
+        {#if latestAdjustment?.blockerSessionId}
+          <p class="px-1 pt-1 text-[11px] font-bold text-amber-700">
+            🔒「{sessionTitle(latestAdjustment.blockerSessionId)}」是固定时间点，挡住了 {latestAdjustment.blocked.length} 场后续安排；它们仍停在原计划，等待管理员处置（调整锁定点或改期）。
+          </p>
+        {/if}
+      </section>
 
       <div class="grid gap-4 xl:grid-cols-[minmax(0,1.65fr)_minmax(300px,.75fr)]">
         <div class="space-y-4">
@@ -289,32 +366,96 @@
 
     {#if tab === 'backstage'}
       <div class="mb-5"><p class="text-[10px] font-black uppercase tracking-[.18em] text-teal-700">后台准备内容 · 不会直接显示给现场</p><h1 class="mt-1 text-3xl font-black">议程、发言人与紧急通知</h1></div>
-      <div class="grid gap-4 xl:grid-cols-[1.3fr_.7fr]">
+      <div class="grid gap-4 xl:grid-cols-[1.5fr_.5fr]">
         <section class="rounded-2xl border bg-white p-4 shadow-sm">
-          <div class="mb-4 flex items-center justify-between"><div><h2 class="font-black">演讲顺序</h2><p class="text-xs text-slate-500">拖动时间、状态或发言人即可更新后台准备内容。</p></div><Button size="sm" on:click={addSession}>新增场次</Button></div>
+          <div class="mb-4 flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h2 class="font-black">演讲顺序与现场重排</h2>
+              <p class="text-xs text-slate-500">每场登记计划时长；某场超时或提前结束时，登记实际结束时刻，后续未开始场次自动重排，原计划时间保留对照。午休等锁定时间点会挡住链条。</p>
+            </div>
+            <div class="flex gap-2">
+              <Button size="sm" color="light" on:click={addBreakSession}>新增午休 / 茶歇</Button>
+              <Button size="sm" on:click={addSession}>新增场次</Button>
+            </div>
+          </div>
           <div class="space-y-3">
-            {#each $desk.sessions.sort((a,b) => a.order - b.order) as session}
-              <article class="grid gap-3 rounded-xl border p-3 md:grid-cols-[80px_1fr_190px_120px]">
-                <input class="focus-ring rounded-lg border px-2 py-2 text-sm font-bold" type="time" value={session.time} on:change={event => updateSession(session.id, { time: (event.target as HTMLInputElement).value })} />
-                <div><input class="focus-ring w-full rounded-lg border px-3 py-2 font-bold" value={session.title} on:change={event => updateSession(session.id, { title: (event.target as HTMLInputElement).value })} /><span class="mt-1 block text-[10px] text-slate-500">{session.room}</span></div>
-                <select class="focus-ring rounded-lg border px-2" value={session.speakerId} on:change={event => updateSession(session.id, { speakerId: (event.target as HTMLSelectElement).value })}>{#each $desk.speakers as speaker}<option value={speaker.id}>{speaker.name}</option>{/each}</select>
-                <select class="focus-ring rounded-lg border px-2" value={session.status} on:change={event => updateSession(session.id, { status: (event.target as HTMLSelectElement).value as Session['status'] })}><option value="upcoming">未开始</option><option value="live">进行中</option><option value="done">已结束</option></select>
-              </article>
+            {#each orderedSessions as session (session.id)}
+              <ScheduleRow {session} {selectedAdjustmentId} on:registered={onRegistered} on:selectAdjustment={event => selectedAdjustmentId = event.detail} />
             {/each}
           </div>
-        </section>
-        <section class="rounded-2xl border bg-white p-4 shadow-sm">
-          <div class="mb-4 flex items-center justify-between"><div><h2 class="font-black">发言人</h2><p class="text-xs text-slate-500">语气、语言方向与标识颜色。</p></div><Button size="sm" color="light" on:click={addSpeaker}>新增</Button></div>
-          <div class="space-y-3">
-            {#each $desk.speakers as speaker}
-              <div class="rounded-xl border p-3">
-                <div class="flex items-center gap-2"><input class="focus-ring h-8 w-8 rounded-lg border-0 p-1" type="color" value={speaker.color} aria-label="标识颜色" on:change={event => updateSpeaker(speaker.id, { color: (event.target as HTMLInputElement).value })} /><input class="focus-ring min-w-0 flex-1 rounded-lg border px-3 py-2 font-bold" value={speaker.name} on:change={event => updateSpeaker(speaker.id, { name: (event.target as HTMLInputElement).value })} /></div>
-                <input class="focus-ring mt-2 w-full rounded-lg border px-3 py-2 text-xs" value={speaker.title} on:change={event => updateSpeaker(speaker.id, { title: (event.target as HTMLInputElement).value })} />
-                <input class="focus-ring mt-2 w-full rounded-lg border px-3 py-2 text-xs" value={speaker.language} on:change={event => updateSpeaker(speaker.id, { language: (event.target as HTMLInputElement).value })} />
-              </div>
-            {/each}
+          <div class="mt-4 flex items-center justify-between gap-3 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">
+            <span>重排只改现场预计时间；需要全部回到原表时可清除调整记录。</span>
+            <Button size="xs" color="light" disabled={!$desk.adjustments.length} on:click={() => { resetSchedule(); selectedAdjustmentId = null; flash('已清除全部现场调整，日程回到原计划。') }}>回到原计划</Button>
           </div>
         </section>
+
+        <div class="space-y-4">
+          <section class="rounded-2xl border bg-white p-4 shadow-sm">
+            <div class="mb-3 flex items-center justify-between">
+              <div><h2 class="font-black">现场重排记录</h2><p class="text-xs text-slate-500">点击任一条，沿同一次调整查看受影响场次与锁定点。记录随本机数据保存，重开页面仍在。</p></div>
+              <span class="rounded-full bg-slate-100 px-2 py-1 text-xs font-black text-slate-600">{$desk.adjustments.length}</span>
+            </div>
+            <div class="max-h-[420px] space-y-2 overflow-y-auto scrollbar-thin">
+              {#each $desk.adjustments as adj, number}
+                <button
+                  type="button"
+                  class="block w-full rounded-xl border p-3 text-left transition {selectedAdjustmentId === adj.id ? 'border-teal-500 bg-teal-50 ring-2 ring-teal-500/40' : 'border-slate-200 bg-slate-50 hover:border-slate-300'}"
+                  on:click={() => selectedAdjustmentId = selectedAdjustmentId === adj.id ? null : adj.id}
+                >
+                  <div class="flex items-center justify-between text-[10px] font-black text-slate-400">
+                    <span>调整 #{$desk.adjustments.length - number}</span><span>{adjustmentTime(adj)}</span>
+                  </div>
+                  <p class="mt-1 text-xs font-bold">「{sessionTitle(adj.sourceSessionId)}」实际结束 <span class="text-teal-800">{adj.actualEnd}</span></p>
+                  <div class="mt-1.5 flex flex-wrap gap-1 text-[10px] font-bold">
+                    <span class="rounded bg-teal-100 px-1.5 py-0.5 text-teal-800">重排 {adj.affected.length} 场</span>
+                    {#if adj.blockerSessionId}
+                      <span class="rounded bg-indigo-100 px-1.5 py-0.5 text-indigo-800">🔒 停在「{sessionTitle(adj.blockerSessionId)}」</span>
+                      <span class="rounded bg-amber-100 px-1.5 py-0.5 text-amber-900">挡住 {adj.blocked.length} 场</span>
+                    {:else}
+                      <span class="rounded bg-emerald-100 px-1.5 py-0.5 text-emerald-800">无锁定点，重排到底</span>
+                    {/if}
+                  </div>
+                  {#if selectedAdjustmentId === adj.id}
+                    <ul class="mt-2 space-y-1 border-t border-slate-200 pt-2 text-[11px]">
+                      {#each adj.affected as id}
+                        {@const row = $desk.sessions.find(item => item.id === id)}
+                        {#if row}
+                          <li class="flex justify-between gap-2">
+                            <span class="truncate text-slate-600">↻ {row.title}</span>
+                            <span class="shrink-0"><s class="text-slate-400">{row.time}</s> <strong class="text-teal-800">{liveStart(row)}</strong></span>
+                          </li>
+                        {/if}
+                      {/each}
+                      {#each adj.blocked as item}
+                        {@const row = $desk.sessions.find(rowItem => rowItem.id === item.sessionId)}
+                        {#if row}
+                          <li class="flex justify-between gap-2 text-amber-800">
+                            <span class="truncate">⛔ {row.title}</span>
+                            <span class="shrink-0">停在 {row.time}（链 {signDelta(item.minutes)}′）</span>
+                          </li>
+                        {/if}
+                      {/each}
+                    </ul>
+                  {/if}
+                </button>
+              {/each}
+              {#if !$desk.adjustments.length}<p class="py-4 text-center text-xs text-slate-400">尚未登记过实际结束时间。</p>{/if}
+            </div>
+          </section>
+
+          <section class="rounded-2xl border bg-white p-4 shadow-sm">
+            <div class="mb-4 flex items-center justify-between"><div><h2 class="font-black">发言人</h2><p class="text-xs text-slate-500">语气、语言方向与标识颜色。</p></div><Button size="sm" color="light" on:click={addSpeaker}>新增</Button></div>
+            <div class="space-y-3">
+              {#each $desk.speakers as speaker}
+                <div class="rounded-xl border p-3">
+                  <div class="flex items-center gap-2"><input class="focus-ring h-8 w-8 rounded-lg border-0 p-1" type="color" value={speaker.color} aria-label="标识颜色" on:change={event => updateSpeaker(speaker.id, { color: (event.target as HTMLInputElement).value })} /><input class="focus-ring min-w-0 flex-1 rounded-lg border px-2 py-2 font-bold" value={speaker.name} on:change={event => updateSpeaker(speaker.id, { name: (event.target as HTMLInputElement).value })} /></div>
+                  <input class="focus-ring mt-2 w-full rounded-lg border px-2 py-2 text-xs" value={speaker.title} on:change={event => updateSpeaker(speaker.id, { title: (event.target as HTMLInputElement).value })} />
+                  <input class="focus-ring mt-2 w-full rounded-lg border px-2 py-2 text-xs" value={speaker.language} on:change={event => updateSpeaker(speaker.id, { language: (event.target as HTMLInputElement).value })} />
+                </div>
+              {/each}
+            </div>
+          </section>
+        </div>
       </div>
     {/if}
 

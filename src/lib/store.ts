@@ -1,5 +1,5 @@
 import { writable, get } from 'svelte/store'
-import type { Announcement, Cue, CueStatus, DeskState, Reminder, Session, Speaker, Term } from './types'
+import type { Announcement, Cue, CueStatus, DeskState, Reminder, ScheduleAdjustment, Session, Speaker, Term } from './types'
 
 const STORAGE_KEY = 'conference-cue-desk-v1'
 const speakers: Speaker[] = [
@@ -9,11 +9,22 @@ const speakers: Speaker[] = [
   { id: 'sp-4', name: '佐藤 美咲', title: '社区能源设计师', language: '日语 → 中文', color: '#be123c' }
 ]
 const sessions: Session[] = [
-  { id: 'se-1', order: 1, time: '09:00', title: '开幕式与议程说明', speakerId: 'sp-2', room: '主会场 A', status: 'done' },
-  { id: 'se-2', order: 2, time: '09:20', title: '城市热岛与适应性基础设施', speakerId: 'sp-1', room: '主会场 A', status: 'live' },
-  { id: 'se-3', order: 3, time: '10:05', title: '社区健康数据的地方行动', speakerId: 'sp-3', room: '主会场 A', status: 'upcoming' },
-  { id: 'se-4', order: 4, time: '10:45', title: '分布式能源与社区共治', speakerId: 'sp-4', room: '主会场 A', status: 'upcoming' }
+  { id: 'se-1', order: 1, time: '09:00', plannedMinutes: 20, title: '开幕式与议程说明', speakerId: 'sp-2', room: '主会场 A', isBreak: false, locked: false, status: 'done', actualEnd: '09:24', liveTime: null, adjustmentId: null, blockedById: null },
+  { id: 'se-2', order: 2, time: '09:20', plannedMinutes: 45, title: '城市热岛与适应性基础设施', speakerId: 'sp-1', room: '主会场 A', isBreak: false, locked: false, status: 'live', actualEnd: null, liveTime: '09:24', adjustmentId: 'adj-seed', blockedById: null },
+  { id: 'se-3', order: 3, time: '10:05', plannedMinutes: 40, title: '社区健康数据的地方行动', speakerId: 'sp-3', room: '主会场 A', isBreak: false, locked: false, status: 'upcoming', actualEnd: null, liveTime: '10:09', adjustmentId: 'adj-seed', blockedById: null },
+  { id: 'se-4', order: 4, time: '10:45', plannedMinutes: 35, title: '分布式能源与社区共治', speakerId: 'sp-4', room: '主会场 A', isBreak: false, locked: false, status: 'upcoming', actualEnd: null, liveTime: '10:49', adjustmentId: 'adj-seed', blockedById: null },
+  { id: 'se-5', order: 5, time: '11:20', plannedMinutes: 90, title: '午休', speakerId: '', room: '主会场 A', isBreak: true, locked: true, status: 'upcoming', actualEnd: null, liveTime: null, adjustmentId: null, blockedById: null },
+  { id: 'se-6', order: 6, time: '12:50', plannedMinutes: 40, title: '圆桌：跨部门气候行动', speakerId: 'sp-2', room: '主会场 A', isBreak: false, locked: false, status: 'upcoming', actualEnd: null, liveTime: null, adjustmentId: null, blockedById: 'adj-seed' },
+  { id: 'se-7', order: 7, time: '13:30', plannedMinutes: 30, title: '闭幕总结与下一步', speakerId: 'sp-3', room: '主会场 A', isBreak: false, locked: false, status: 'upcoming', actualEnd: null, liveTime: null, adjustmentId: null, blockedById: 'adj-seed' }
 ]
+function seedAdjustment(): ScheduleAdjustment {
+  return {
+    id: 'adj-seed', sourceSessionId: 'se-1', actualEnd: '09:24',
+    createdAt: new Date(Date.now() - 22 * 60000).toISOString(), blockerSessionId: 'se-5',
+    affected: ['se-2', 'se-3', 'se-4'],
+    blocked: [{ sessionId: 'se-6', minutes: 4 }, { sessionId: 'se-7', minutes: 4 }]
+  }
+}
 const terms: Term[] = [
   { id: 'term-1', source: 'urban heat island', target: '城市热岛', note: '首次出现完整译出，后可简称热岛', speakerId: 'sp-1', priority: 'high' },
   { id: 'term-2', source: 'resilience', target: '韧性', note: '不使用“恢复力”', speakerId: 'sp-1', priority: 'high' },
@@ -32,7 +43,7 @@ function initialCues(): Cue[] {
 }
 function demoState(): DeskState {
   return {
-    speakers, sessions, terms, cues: initialCues(), reminders: [], activeCueId: 'cue-103', fontScale: 100,
+    speakers, sessions, adjustments: [seedAdjustment()], terms, cues: initialCues(), reminders: [], activeCueId: 'cue-103', fontScale: 100,
     announcements: [
       { id: 'ann-1', level: 'info', text: '十点整有消防联动测试，请提醒会场人员保持镇定。', visibleOnStage: false, createdAt: new Date().toISOString() },
       { id: 'ann-2', level: 'urgent', text: '请下一位发言人提前到侧台候场。', visibleOnStage: false, createdAt: new Date().toISOString() }
@@ -40,12 +51,29 @@ function demoState(): DeskState {
     online: true, liveSimulation: true, updatedAt: new Date().toISOString()
   }
 }
+function migrate(state: DeskState): DeskState {
+  state.adjustments ??= []
+  state.sessions = state.sessions.map(row => {
+    const legacy = row as Partial<Session>
+    return {
+      ...row,
+      plannedMinutes: legacy.plannedMinutes ?? 30,
+      isBreak: legacy.isBreak ?? false,
+      locked: legacy.locked ?? false,
+      actualEnd: legacy.actualEnd ?? null,
+      liveTime: legacy.liveTime ?? null,
+      adjustmentId: legacy.adjustmentId ?? null,
+      blockedById: legacy.blockedById ?? null
+    }
+  })
+  return state
+}
 function clone<T>(value: T): T { return structuredClone(value) }
 function loadState(): DeskState {
   if (typeof localStorage === 'undefined') return demoState()
   try {
     const saved = localStorage.getItem(STORAGE_KEY)
-    return saved ? { ...demoState(), ...JSON.parse(saved), online: navigator.onLine } : demoState()
+    return saved ? migrate({ ...demoState(), ...JSON.parse(saved), online: navigator.onLine }) : demoState()
   } catch { return demoState() }
 }
 const history: DeskState[] = []
@@ -85,10 +113,126 @@ export function addSpeaker() {
   commit(state => state.speakers.push({ id: `sp-${Date.now()}`, name: '新发言人', title: '待填写机构与职务', language: '待设置语言方向', color: '#475569' }))
 }
 export function updateSpeaker(id: string, patch: Partial<Speaker>) { commit(state => { const item = state.speakers.find(row => row.id === id); if (item) Object.assign(item, patch) }) }
+
+/* ---------- 日程时间工具 ---------- */
+export function toMinutes(hhmm: string): number {
+  const [h = '0', m = '0'] = hhmm.split(':')
+  return Number(h) * 60 + Number(m)
+}
+export function toHHMM(minutes: number): string {
+  const wrapped = ((Math.round(minutes) % 1440) + 1440) % 1440
+  return `${String(Math.floor(wrapped / 60)).padStart(2, '0')}:${String(wrapped % 60).padStart(2, '0')}`
+}
+export function addMinutesHHMM(hhmm: string, delta: number): string { return toHHMM(toMinutes(hhmm) + delta) }
+export function deltaHHMM(later: string, earlier: string): number { return toMinutes(later) - toMinutes(earlier) }
+export function sortedSessions(state: DeskState): Session[] { return [...state.sessions].sort((a, b) => a.order - b.order) }
+/** 现场预计开始：已重排取 liveTime，否则沿用原计划 */
+export function liveStart(session: Session): string { return session.liveTime ?? session.time }
+export function plannedEnd(session: Session): string { return addMinutesHHMM(session.time, session.plannedMinutes) }
+/** 现场预计/实际结束：已登记取实际结束，否则按现场开始 + 计划时长 */
+export function liveEnd(session: Session): string {
+  if (session.actualEnd) return session.actualEnd
+  return addMinutesHHMM(liveStart(session), session.plannedMinutes)
+}
+/** 相对原计划的偏差（分钟），正数为拖堂、负数为提前 */
+export function liveDelta(session: Session): number { return deltaHHMM(liveStart(session), session.time) }
+/** 现场链条若越过锁定点，与锁定开始时间的冲突分钟数（无冲突为 0） */
+export function collisionMinutes(session: Session, blocker: Session): number {
+  return Math.max(0, toMinutes(liveEnd(session)) - toMinutes(blocker.time))
+}
+export function findAdjustment(state: DeskState, id: string | null): ScheduleAdjustment | undefined {
+  return id ? state.adjustments.find(item => item.id === id) : undefined
+}
+export function signDelta(minutes: number): string { return minutes > 0 ? `+${minutes}` : `${minutes}` }
+
+/* ---------- 日程编辑与现场重排 ---------- */
 export function addSession() {
-  commit(state => state.sessions.push({ id: `se-${Date.now()}`, order: Math.max(0, ...state.sessions.map(item => item.order)) + 1, time: '11:30', title: '新演讲', speakerId: state.speakers[0]?.id || '', room: '主会场 A', status: 'upcoming' }))
+  commit(state => {
+    const rows = sortedSessions(state)
+    const last = rows.at(-1)
+    const time = last ? addMinutesHHMM(last.time, last.plannedMinutes) : '11:30'
+    state.sessions.push({
+      id: `se-${Date.now()}`, order: rows.reduce((max, item) => Math.max(max, item.order), 0) + 1,
+      time, plannedMinutes: 30, title: '新演讲', speakerId: state.speakers[0]?.id || '', room: '主会场 A',
+      isBreak: false, locked: false, status: 'upcoming',
+      actualEnd: null, liveTime: null, adjustmentId: null, blockedById: null
+    })
+  })
+}
+export function addBreakSession() {
+  commit(state => {
+    const rows = sortedSessions(state)
+    const last = rows.at(-1)
+    const time = last ? addMinutesHHMM(last.time, last.plannedMinutes) : '12:00'
+    state.sessions.push({
+      id: `se-${Date.now()}`, order: rows.reduce((max, item) => Math.max(max, item.order), 0) + 1,
+      time, plannedMinutes: 60, title: '午休 / 茶歇', speakerId: '', room: '主会场 A',
+      isBreak: true, locked: true, status: 'upcoming',
+      actualEnd: null, liveTime: null, adjustmentId: null, blockedById: null
+    })
+  })
 }
 export function updateSession(id: string, patch: Partial<Session>) { commit(state => { const item = state.sessions.find(row => row.id === id); if (item) Object.assign(item, patch) }) }
+
+/**
+ * 登记某场的实际结束时刻并级联重排：
+ * 后续「未开始且未锁定」的场次依次按计划时长顺延/提前；
+ * 遇到锁定场（午休等固定时间点）立即停住，其后的场次保留原计划并登记为被挡。
+ */
+export function recordSessionEnd(id: string, actualEnd: string): string | null {
+  const state = get(desk)
+  const rows = sortedSessions(state)
+  const index = rows.findIndex(item => item.id === id)
+  if (index === -1) return null
+  const adjustmentId = `adj-${Date.now()}`
+  commit(draft => {
+    const ordered = sortedSessions(draft)
+    const source = draft.sessions.find(item => item.id === id)!
+    source.actualEnd = actualEnd
+    if (source.status === 'live') source.status = 'done'
+    const adjustment: ScheduleAdjustment = {
+      id: adjustmentId, sourceSessionId: id, actualEnd,
+      createdAt: new Date().toISOString(), blockerSessionId: null,
+      affected: [], blocked: []
+    }
+    let cursor = toMinutes(actualEnd)
+    for (let i = index + 1; i < ordered.length; i++) {
+      const row = draft.sessions.find(item => item.id === ordered[i].id)!
+      row.blockedById = null
+      row.adjustmentId = null
+      row.liveTime = null
+      // 已结束的场次是固定锚点；未开始或进行中的场次跟随链条
+      if (row.status === 'done') break
+      if (row.locked) {
+        adjustment.blockerSessionId = row.id
+        const slip = cursor - toMinutes(row.time)
+        for (let j = i + 1; j < ordered.length; j++) {
+          const later = draft.sessions.find(item => item.id === ordered[j].id)!
+          if (later.status === 'done') continue
+          later.liveTime = null
+          later.adjustmentId = null
+          later.blockedById = adjustmentId
+          adjustment.blocked.push({ sessionId: later.id, minutes: slip })
+        }
+        break
+      }
+      row.liveTime = toHHMM(cursor)
+      row.adjustmentId = adjustmentId
+      adjustment.affected.push(row.id)
+      cursor += row.plannedMinutes
+    }
+    draft.adjustments.unshift(adjustment)
+  })
+  return adjustmentId
+}
+/** 清除所有现场预计时间、实际结束与调整记录，回到原计划 */
+export function resetSchedule() {
+  commit(state => {
+    state.adjustments = []
+    state.sessions.forEach(item => { item.actualEnd = null; item.liveTime = null; item.adjustmentId = null; item.blockedById = null })
+  })
+}
+
 export function addTerm() { commit(state => state.terms.push({ id: `term-${Date.now()}`, source: 'new term', target: '新术语', note: '', speakerId: state.speakers[0]?.id || '', priority: 'normal' })) }
 export function updateTerm(id: string, patch: Partial<Term>) { commit(state => { const item = state.terms.find(row => row.id === id); if (item) Object.assign(item, patch) }) }
 export function addAnnouncement(text: string, level: Announcement['level']) {
@@ -112,6 +256,7 @@ export function setOnline(online: boolean) {
   })
 }
 export function setLiveSimulation(enabled: boolean) { commit(state => { state.liveSimulation = enabled }) }
+export function setFontScale(scale: number) { commit(state => { state.fontScale = Math.min(150, Math.max(85, scale)) }) }
 export function setActiveCue(id: string) { commit(state => { state.activeCueId = id }) }
 export function moveCue(direction: 1 | -1) {
   const state = get(desk)
@@ -119,8 +264,6 @@ export function moveCue(direction: 1 | -1) {
   const next = state.cues[index + direction]
   if (next) setActiveCue(next.id)
 }
-export function setFontScale(scale: number) { commit(state => { state.fontScale = Math.min(150, Math.max(85, scale)) }) }
-
 export function ingestCue(text: string, options: { manual?: boolean; speakerId?: string; receivedAt?: number } = {}) {
   const trimmed = text.trim()
   if (!trimmed) return
@@ -129,12 +272,13 @@ export function ingestCue(text: string, options: { manual?: boolean; speakerId?:
     const duplicate = findDuplicate(trimmed, existing)
     const speakerId = options.speakerId || state.sessions.find(item => item.status === 'live')?.speakerId || state.speakers[0]?.id || ''
     const receivedAt = options.receivedAt || Date.now()
-    const cue: Cue = {
+    state.cues.push({
       id: `cue-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, speakerId, text: trimmed, receivedAt,
-      status: 'pending', manual: Boolean(options.manual), offline: !state.online, delaySeconds: Math.max(0, Math.round((Date.now() - receivedAt) / 1000)),
+      status: 'pending', manual: Boolean(options.manual), offline: !state.online,
+      delaySeconds: Math.max(0, Math.round((Date.now() - receivedAt) / 1000)),
       duplicateOf: duplicate?.id || null, followupText: '', tags: detectTerms(trimmed, state.terms)
-    }
-    state.cues.push(cue); state.activeCueId = cue.id
+    })
+    state.activeCueId = state.cues.at(-1)!.id
   })
 }
 export function updateCue(id: string, patch: Partial<Cue>) { commit(state => { const cue = state.cues.find(item => item.id === id); if (cue) Object.assign(cue, patch) }) }
