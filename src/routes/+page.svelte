@@ -3,11 +3,12 @@
   import Button from 'flowbite-svelte/Button.svelte'
   import {
     acknowledgeReminder, addAnnouncement, addSession, addSpeaker, addTerm, canRedo, canUndo, clearDuplicate,
-    deleteCue, desk, getDelay, ingestCue, moveCue, publishAnnouncement, redoDesk, sendReminder, setActiveCue,
-    setCueStatus, setFontScale, setLiveSimulation, setOnline, speakerName, termTarget, undoDesk, updateCue,
-    updateSession, updateSpeaker, updateTerm
+    deleteCue, desk, getDelay, ingestCue, moveCue, publishAnnouncement, recordActualEnd, redoDesk, resetSchedule,
+    sendReminder, setActiveCue, setCueStatus, setFontScale, setLiveSimulation, setOnline, speakerName, termTarget,
+    undoDesk, updateCue, updateSession, updateSpeaker, updateTerm
   } from '$lib/store'
-  import type { Announcement, Cue, Session, TabId, Term } from '$lib/types'
+  import { addMinutes, diffMinutes, liveEnd as liveEndOf, liveStart as liveStartOf, plannedEnd, sortedSessions, toMinutes } from '$lib/schedule'
+  import type { Announcement, Cue, ScheduleAdjustment, Session, TabId, Term } from '$lib/types'
 
   const liveLines = [
     'Cooling corridors can connect parks, schools, and shaded transit stops.',
@@ -39,6 +40,53 @@
   $: activeSpeaker = $desk.speakers.find(item => item.id === activeCue?.speakerId)
   $: activeTerms = $desk.terms.filter(item => item.speakerId === activeCue?.speakerId || activeCue?.tags.includes(item.target))
   $: unreadReminders = $desk.reminders.filter(item => !item.acknowledged)
+
+  // —— 现场日程：原计划与现场预计时间并行对照 ——
+  $: orderedSessions = sortedSessions($desk.sessions)
+  $: latestAdjustment = $desk.adjustments.at(-1) || null
+  let actualEndDraft: Record<string, string> = {}
+  let showAdjustments = false
+
+  function currentTimeHHMM() {
+    const d = new Date()
+    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+  }
+  function endDraft(session: Session): string {
+    return actualEndDraft[session.id] ?? addMinutes(session.liveStart || session.time, session.durationMinutes)
+  }
+  function submitActualEnd(session: Session) {
+    const value = endDraft(session)
+    if (!value) return
+    recordActualEnd(session.id, value)
+    flash(`已登记实际结束 ${value}，后续场次已按现场时刻重排。`)
+  }
+  function sessionLiveStart(session: Session): string { return liveStartOf(session, orderedSessions) }
+  function sessionLiveEnd(session: Session): string { return liveEndOf(session, orderedSessions) }
+  /** 预计开始相对原计划的偏差（分钟）：正为延后，负为提前 */
+  function startDelta(session: Session): number { return diffMinutes(session.time, sessionLiveStart(session)) }
+  function shiftBadge(delta: number): string {
+    if (delta === 0) return '按原计划'
+    return delta > 0 ? `顺延 +${delta} 分钟` : `提前 ${Math.abs(delta)} 分钟`
+  }
+  function shiftBadgeClass(delta: number): string {
+    if (delta === 0) return 'bg-slate-100 text-slate-600'
+    return delta > 0 ? 'bg-red-100 text-red-800' : 'bg-sky-100 text-sky-800'
+  }
+  function adjustmentLabel(adjustment: ScheduleAdjustment): string {
+    const d = adjustment.deltaMinutes
+    const core = d === 0 ? '按时结束' : d > 0 ? `超时 +${d} 分钟` : `提前 ${Math.abs(d)} 分钟`
+    return core
+  }
+  /** 进行中的场次按“此刻”推算已讲时长与超时情况 */
+  function liveOverrun(session: Session): number {
+    if (session.status !== 'live') return 0
+    const elapsed = toMinutes(currentTimeHHMM()) - toMinutes(sessionLiveStart(session))
+    return elapsed - session.durationMinutes
+  }
+  /** 已结束场次实际结束相对其原计划结束的偏差 */
+  function endDelta(session: Session): number {
+    return session.liveEnd ? diffMinutes(plannedEnd(session), session.liveEnd) : 0
+  }
 
   onMount(() => {
     if (typeof navigator !== 'undefined') setOnline(navigator.onLine)
@@ -176,7 +224,15 @@
         <div>
           <p class="text-[10px] font-black uppercase tracking-[.18em] text-teal-700">当前场次 · {$desk.online ? 'LIVE' : 'OFFLINE MODE'}</p>
           <h1 class="mt-1 text-2xl font-black tracking-tight lg:text-4xl">{currentSession?.title}</h1>
-          <p class="mt-2 text-sm text-slate-500">{currentSession?.time} · {currentSession?.room} · {$desk.speakers.find(item => item.id === currentSession?.speakerId)?.name}</p>
+          {#if currentSession && !currentSession.isBreak}
+            {@const cDelta = startDelta(currentSession)}
+            <p class="mt-2 text-sm text-slate-500">
+              <span class="font-mono">{currentSession.time}–{plannedEnd(currentSession)}</span> 原计划 ·
+              <span class="font-mono font-bold text-teal-800">{sessionLiveStart(currentSession)}–{sessionLiveEnd(currentSession)}</span> 现场预计
+              {#if cDelta !== 0}<span class="ml-1 rounded-full px-2 py-0.5 text-[10px] font-bold {shiftBadgeClass(cDelta)}">{shiftBadge(cDelta)}</span>{/if}
+              · {currentSession.room} · {$desk.speakers.find(item => item.id === currentSession.speakerId)?.name}
+            </p>
+          {/if}
         </div>
         <div class="grid grid-cols-3 gap-2 text-center">
           <div class="rounded-xl border bg-white px-4 py-2"><strong class="block text-xl">{pendingCount}</strong><span class="text-[10px] text-slate-500">待传</span></div>
@@ -184,6 +240,124 @@
           <div class="rounded-xl border bg-white px-4 py-2"><strong class="block text-xl text-red-700">{duplicateCount}</strong><span class="text-[10px] text-slate-500">疑似重复</span></div>
         </div>
       </div>
+
+      <!-- 现场日程板：原计划为对照，现场预计时间随登记重排 -->
+      <section class="mb-4 rounded-2xl border bg-white shadow-sm">
+        <div class="flex flex-wrap items-center justify-between gap-3 border-b px-4 py-3">
+          <div>
+            <span class="text-[10px] font-black uppercase tracking-[.16em] text-teal-700">现场日程 · 按实际结束时刻滚动</span>
+            <h2 class="mt-1 font-bold">计划 vs 现场预计</h2>
+          </div>
+          <div class="flex items-center gap-2">
+            <button class="focus-ring rounded-lg border px-3 py-1.5 text-xs font-bold" class:opacity-50={!$desk.adjustments.length} disabled={!$desk.adjustments.length} on:click={() => showAdjustments = !showAdjustments}>
+              调整记录（{$desk.adjustments.length}）
+            </button>
+            <Button size="xs" color="light" disabled={!$desk.adjustments.length} on:click={resetSchedule}>恢复原计划</Button>
+          </div>
+        </div>
+
+        {#if latestAdjustment?.blockerSessionId}
+          <div role="alert" class="border-b border-red-200 bg-red-50 px-4 py-3 text-sm text-red-900">
+            <p class="font-black">⛔ 顺延停在「{latestAdjustment.blockerTitle}」{latestAdjustment.blockerIsBreak ? '（固定休息时间）' : '（时间已锁定）'}，无法继续自动后移：</p>
+            <ul class="mt-1 list-disc pl-5 text-xs leading-6">
+              {#each latestAdjustment.blocked as item}
+                <li><strong>{item.title}</strong> · 原计划 {item.plannedStart}</li>
+              {/each}
+            </ul>
+            {#if latestAdjustment.overflowMinutes > 0}
+              <p class="mt-1 text-xs font-bold">链条到达时已比锁定点晚 {latestAdjustment.overflowMinutes} 分钟，需要管理员协商处理。</p>
+            {:else}
+              <p class="mt-1 text-xs">当前尚有缓冲，锁定安排未被挤压；其后场次仍按原计划等待。</p>
+            {/if}
+          </div>
+        {/if}
+
+        <div class="grid gap-2 p-3 lg:grid-cols-2 xl:grid-cols-4">
+          {#each orderedSessions as session}
+            {@const first = orderedSessions[0]}
+            {@const lStart = sessionLiveStart(session)}
+            {@const lEnd = sessionLiveEnd(session)}
+            {@const delta = startDelta(session)}
+            {@const blockedHere = latestAdjustment?.blocked.some(item => item.id === session.id) ?? false}
+            <article class="flex flex-col rounded-xl border p-3 {session.status === 'live' ? 'border-teal-500 bg-teal-50/60 ring-2 ring-teal-200' : session.status === 'done' ? 'border-slate-200 bg-slate-50' : 'border-slate-200'} {blockedHere ? 'border-red-300 bg-red-50/50' : ''}">
+              <div class="mb-1 flex items-center justify-between gap-2 text-[10px] font-black">
+                <span class="rounded-md px-2 py-0.5 {session.isBreak ? 'bg-amber-100 text-amber-800' : session.status === 'live' ? 'bg-teal-600 text-white' : session.status === 'done' ? 'bg-slate-200 text-slate-600' : 'bg-slate-100 text-slate-600'}">
+                  {session.isBreak ? '休息' : session.status === 'live' ? '进行中' : session.status === 'done' ? '已结束' : '未开始'}
+                </span>
+                {#if session.locked && !session.isBreak}<span class="rounded-md bg-slate-800 px-2 py-0.5 text-white">锁定</span>{/if}
+                {#if blockedHere && latestAdjustment?.blockerSessionId === session.id}<span class="rounded-md bg-red-600 px-2 py-0.5 text-white">阻挡点</span>{/if}
+              </div>
+              <strong class="block text-sm leading-5">{session.title}</strong>
+              {#if !session.isBreak}<span class="mt-0.5 text-[10px] text-slate-500">{speakerName($desk, session.speakerId)} · {session.room}</span>{/if}
+
+              <div class="mt-2 space-y-1 text-[11px]">
+                <div class="flex items-center justify-between gap-2"><span class="text-slate-400">原计划</span><span class="font-mono text-slate-500 line-through decoration-slate-300">{session.time}–{plannedEnd(session)}</span></div>
+                <div class="flex items-center justify-between gap-2">
+                  <span class="font-bold {session.isBreak || session.locked ? 'text-amber-700' : 'text-teal-700'}">{session.isBreak || session.locked ? '固定' : '现场预计'}</span>
+                  <span class="font-mono font-bold">{lStart}–{lEnd}</span>
+                </div>
+              </div>
+
+              {#if !session.isBreak && !session.locked}
+                <span class="mt-2 inline-block w-fit rounded-full px-2 py-0.5 text-[10px] font-bold {shiftBadgeClass(delta)}">{shiftBadge(delta)}</span>
+              {/if}
+              {#if session.status === 'live' && !session.isBreak}
+                {@const over = liveOverrun(session)}
+                <p class="mt-1 text-[10px] font-bold {over > 0 ? 'text-red-700' : 'text-slate-500'}">{over > 0 ? `已超时 ${over} 分钟（计划 ${session.durationMinutes} 分钟）` : `计划时长 ${session.durationMinutes} 分钟`}</p>
+              {/if}
+
+              {#if !session.isBreak}
+                <div class="mt-auto pt-2">
+                  {#if session.status !== 'done'}
+                    <label class="block text-[10px] font-bold text-slate-500" for={`end-${session.id}`}>{session.status === 'live' ? '登记实际结束' : '提前/按此刻登记结束'}</label>
+                    <div class="mt-1 flex gap-1">
+                      <input id={`end-${session.id}`} type="time" class="focus-ring min-w-0 flex-1 rounded-lg border px-1.5 py-1 text-xs" value={endDraft(session)} on:change={event => (actualEndDraft = { ...actualEndDraft, [session.id]: (event.target as HTMLInputElement).value })} />
+                      <Button size="xs" color={session.status === 'live' ? 'green' : 'light'} on:click={() => submitActualEnd(session)}>登记</Button>
+                    </div>
+                  {:else if session.liveEnd}
+                    <p class="text-[10px] font-bold text-slate-500">实际结束 {session.liveEnd} · <span class={endDelta(session) > 0 ? 'text-red-700' : endDelta(session) < 0 ? 'text-sky-700' : 'text-slate-500'}>{endDelta(session) === 0 ? '按时结束' : endDelta(session) > 0 ? `超时 +${endDelta(session)} 分钟` : `提前 ${Math.abs(endDelta(session))} 分钟`}</span></p>
+                  {/if}
+                </div>
+              {/if}
+            </article>
+          {/each}
+        </div>
+
+        {#if showAdjustments}
+          <div class="border-t bg-slate-50 px-4 py-3">
+            <h3 class="text-xs font-black uppercase tracking-wider text-slate-500">重排留痕（随本机保存，重开页面仍可沿同一次调整查看）</h3>
+            <div class="mt-2 space-y-2">
+              {#each [...$desk.adjustments].reverse() as adjustment, index}
+                <details class="rounded-xl border border-slate-200 bg-white p-3 text-xs" open={index === 0}>
+                  <summary class="cursor-pointer font-bold">
+                    <span class="mr-2 rounded-full bg-teal-100 px-2 py-0.5 text-teal-800">{adjustmentLabel(adjustment)}</span>
+                    「{adjustment.anchorTitle}」实际 {adjustment.actualEnd} 结束（计划 {adjustment.plannedEnd}）
+                    <span class="ml-1 font-normal text-slate-400">{new Date(adjustment.createdAt).toLocaleTimeString('zh-CN', { hour12: false })}</span>
+                  </summary>
+                  <div class="mt-2 grid gap-2 md:grid-cols-2">
+                    <div>
+                      <p class="font-black text-slate-600">已重排（{adjustment.shifted.length}）</p>
+                      {#if adjustment.shifted.length}
+                        <ul class="mt-1 list-disc pl-4 leading-6">{#each adjustment.shifted as item}<li>{item.title} · 现场预计 {item.liveStart}–{item.liveEnd}</li>{/each}</ul>
+                      {:else}<p class="mt-1 text-slate-400">其后没有可移动的场次。</p>{/if}
+                    </div>
+                    <div>
+                      <p class="font-black text-red-700">锁定点挡住的安排（{adjustment.blocked.length}）</p>
+                      {#if adjustment.blockerSessionId}
+                        <ul class="mt-1 list-disc pl-4 leading-6 text-red-800">
+                          {#each adjustment.blocked as item}<li>{item.title} · 保持原计划 {item.plannedStart}</li>{/each}
+                        </ul>
+                        {#if adjustment.overflowMinutes > 0}<p class="mt-1 font-bold">超出锁定点 {adjustment.overflowMinutes} 分钟。</p>{/if}
+                      {:else}<p class="mt-1 text-slate-400">本次顺延未撞到午休或锁定场次。</p>{/if}
+                    </div>
+                  </div>
+                </details>
+              {/each}
+              {#if !$desk.adjustments.length}<p class="py-3 text-center text-xs text-slate-400">尚未登记过实际结束；登记后这里保留每次重排的对照留痕。</p>{/if}
+            </div>
+          </div>
+        {/if}
+      </section>
 
       <div class="grid gap-4 xl:grid-cols-[minmax(0,1.65fr)_minmax(300px,.75fr)]">
         <div class="space-y-4">
@@ -291,14 +465,33 @@
       <div class="mb-5"><p class="text-[10px] font-black uppercase tracking-[.18em] text-teal-700">后台准备内容 · 不会直接显示给现场</p><h1 class="mt-1 text-3xl font-black">议程、发言人与紧急通知</h1></div>
       <div class="grid gap-4 xl:grid-cols-[1.3fr_.7fr]">
         <section class="rounded-2xl border bg-white p-4 shadow-sm">
-          <div class="mb-4 flex items-center justify-between"><div><h2 class="font-black">演讲顺序</h2><p class="text-xs text-slate-500">拖动时间、状态或发言人即可更新后台准备内容。</p></div><Button size="sm" on:click={addSession}>新增场次</Button></div>
+          <div class="mb-4 flex items-center justify-between"><div><h2 class="font-black">演讲顺序</h2><p class="text-xs text-slate-500">每场登记计划时长；锁定场次和午休不会被自动顺延。时间重排在“现场传译”页登记实际结束时完成。</p></div><Button size="sm" on:click={addSession}>新增场次</Button></div>
           <div class="space-y-3">
             {#each $desk.sessions.sort((a,b) => a.order - b.order) as session}
-              <article class="grid gap-3 rounded-xl border p-3 md:grid-cols-[80px_1fr_190px_120px]">
-                <input class="focus-ring rounded-lg border px-2 py-2 text-sm font-bold" type="time" value={session.time} on:change={event => updateSession(session.id, { time: (event.target as HTMLInputElement).value })} />
-                <div><input class="focus-ring w-full rounded-lg border px-3 py-2 font-bold" value={session.title} on:change={event => updateSession(session.id, { title: (event.target as HTMLInputElement).value })} /><span class="mt-1 block text-[10px] text-slate-500">{session.room}</span></div>
-                <select class="focus-ring rounded-lg border px-2" value={session.speakerId} on:change={event => updateSession(session.id, { speakerId: (event.target as HTMLSelectElement).value })}>{#each $desk.speakers as speaker}<option value={speaker.id}>{speaker.name}</option>{/each}</select>
-                <select class="focus-ring rounded-lg border px-2" value={session.status} on:change={event => updateSession(session.id, { status: (event.target as HTMLSelectElement).value as Session['status'] })}><option value="upcoming">未开始</option><option value="live">进行中</option><option value="done">已结束</option></select>
+              <article class="rounded-xl border p-3 {session.isBreak ? 'border-amber-300 bg-amber-50/50' : session.locked ? 'border-slate-400 bg-slate-50' : ''}">
+                <div class="grid gap-3 md:grid-cols-[80px_110px_1fr_190px_120px]">
+                  <label class="text-[10px] font-bold text-slate-500">计划开始
+                    <input class="focus-ring mt-1 w-full rounded-lg border px-2 py-2 text-sm font-bold" type="time" value={session.time} on:change={event => updateSession(session.id, { time: (event.target as HTMLInputElement).value })} />
+                  </label>
+                  <label class="text-[10px] font-bold text-slate-500">计划时长（分）
+                    <input class="focus-ring mt-1 w-full rounded-lg border px-2 py-2 text-sm font-bold" type="number" min="5" step="5" value={session.durationMinutes} on:change={event => updateSession(session.id, { durationMinutes: Math.max(5, Number((event.target as HTMLInputElement).value) || 30) })} />
+                  </label>
+                  {#if session.isBreak}
+                    <div class="flex items-center text-sm font-black text-amber-800">☕ {session.title}（午休 / 茶歇 · 固定时间锚点）</div>
+                  {:else}
+                    <div><input class="focus-ring w-full rounded-lg border px-2 py-2 font-bold" value={session.title} on:change={event => updateSession(session.id, { title: (event.target as HTMLInputElement).value })} /><span class="mt-1 block text-[10px] text-slate-500">原计划 {session.time}–{plannedEnd(session)} · {session.room}</span></div>
+                  {/if}
+                  {#if !session.isBreak}
+                    <select class="focus-ring self-start rounded-lg border px-2 py-2" value={session.speakerId} on:change={event => updateSession(session.id, { speakerId: (event.target as HTMLSelectElement).value })}>{#each $desk.speakers as speaker}<option value={speaker.id}>{speaker.name}</option>{/each}</select>
+                  {:else}
+                    <input class="focus-ring self-start rounded-lg border px-2 py-2 text-sm font-bold" value={session.title} placeholder="午休 / 茶歇名称" on:change={event => updateSession(session.id, { title: (event.target as HTMLInputElement).value })} />
+                  {/if}
+                  <select class="focus-ring self-start rounded-lg border px-2 py-2" value={session.status} on:change={event => updateSession(session.id, { status: (event.target as HTMLSelectElement).value as Session['status'] })}><option value="upcoming">未开始</option><option value="live">进行中</option><option value="done">已结束</option></select>
+                </div>
+                <div class="mt-2 flex flex-wrap gap-4 text-[11px] font-bold">
+                  <label class="flex items-center gap-1.5"><input type="checkbox" class="h-4 w-4 accent-amber-600" checked={session.isBreak} on:change={event => { const isBreak = (event.target as HTMLInputElement).checked; updateSession(session.id, { isBreak, locked: isBreak ? true : session.locked }) }} />午休 / 茶歇（重排到这里停止）</label>
+                  <label class="flex items-center gap-1.5 {session.isBreak ? 'opacity-40' : ''}"><input type="checkbox" class="h-4 w-4 accent-slate-800" disabled={session.isBreak} checked={session.locked} on:change={event => updateSession(session.id, { locked: (event.target as HTMLInputElement).checked })} />时间锁定（不允许自动顺延）</label>
+                </div>
               </article>
             {/each}
           </div>

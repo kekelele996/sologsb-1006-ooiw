@@ -1,5 +1,6 @@
 import { writable, get } from 'svelte/store'
-import type { Announcement, Cue, CueStatus, DeskState, Reminder, Session, Speaker, Term } from './types'
+import type { Announcement, Cue, CueStatus, DeskState, Reminder, ScheduleAdjustment, Session, Speaker, Term } from './types'
+import { diffMinutes, liveEnd, plannedEnd, reschedule, sortedSessions, toMinutes } from './schedule'
 
 const STORAGE_KEY = 'conference-cue-desk-v1'
 const speakers: Speaker[] = [
@@ -9,10 +10,14 @@ const speakers: Speaker[] = [
   { id: 'sp-4', name: '佐藤 美咲', title: '社区能源设计师', language: '日语 → 中文', color: '#be123c' }
 ]
 const sessions: Session[] = [
-  { id: 'se-1', order: 1, time: '09:00', title: '开幕式与议程说明', speakerId: 'sp-2', room: '主会场 A', status: 'done' },
-  { id: 'se-2', order: 2, time: '09:20', title: '城市热岛与适应性基础设施', speakerId: 'sp-1', room: '主会场 A', status: 'live' },
-  { id: 'se-3', order: 3, time: '10:05', title: '社区健康数据的地方行动', speakerId: 'sp-3', room: '主会场 A', status: 'upcoming' },
-  { id: 'se-4', order: 4, time: '10:45', title: '分布式能源与社区共治', speakerId: 'sp-4', room: '主会场 A', status: 'upcoming' }
+  { id: 'se-1', order: 1, time: '09:00', durationMinutes: 20, title: '开幕式与议程说明', speakerId: 'sp-2', room: '主会场 A', status: 'done', isBreak: false, locked: false, liveStart: '09:00', liveEnd: '09:20' },
+  { id: 'se-2', order: 2, time: '09:20', durationMinutes: 45, title: '城市热岛与适应性基础设施', speakerId: 'sp-1', room: '主会场 A', status: 'live', isBreak: false, locked: false, liveStart: '09:20', liveEnd: null },
+  { id: 'se-3', order: 3, time: '10:05', durationMinutes: 40, title: '社区健康数据的地方行动', speakerId: 'sp-3', room: '主会场 A', status: 'upcoming', isBreak: false, locked: false, liveStart: null, liveEnd: null },
+  { id: 'se-4', order: 4, time: '10:45', durationMinutes: 35, title: '分布式能源与社区共治', speakerId: 'sp-4', room: '主会场 A', status: 'upcoming', isBreak: false, locked: false, liveStart: null, liveEnd: null },
+  { id: 'se-break', order: 5, time: '11:20', durationMinutes: 90, title: '午休', speakerId: '', room: '', status: 'upcoming', isBreak: true, locked: true, liveStart: null, liveEnd: null },
+  { id: 'se-5', order: 6, time: '12:50', durationMinutes: 30, title: '午间案例：韧性街区复盘', speakerId: 'sp-2', room: '主会场 A', status: 'upcoming', isBreak: false, locked: false, liveStart: null, liveEnd: null },
+  { id: 'se-6', order: 7, time: '13:20', durationMinutes: 40, title: '圆桌：跨部门气候协作', speakerId: 'sp-1', room: '主会场 A', status: 'upcoming', isBreak: false, locked: true, liveStart: null, liveEnd: null },
+  { id: 'se-7', order: 8, time: '14:00', durationMinutes: 20, title: '总结与闭幕', speakerId: 'sp-2', room: '主会场 A', status: 'upcoming', isBreak: false, locked: false, liveStart: null, liveEnd: null }
 ]
 const terms: Term[] = [
   { id: 'term-1', source: 'urban heat island', target: '城市热岛', note: '首次出现完整译出，后可简称热岛', speakerId: 'sp-1', priority: 'high' },
@@ -37,15 +42,35 @@ function demoState(): DeskState {
       { id: 'ann-1', level: 'info', text: '十点整有消防联动测试，请提醒会场人员保持镇定。', visibleOnStage: false, createdAt: new Date().toISOString() },
       { id: 'ann-2', level: 'urgent', text: '请下一位发言人提前到侧台候场。', visibleOnStage: false, createdAt: new Date().toISOString() }
     ],
-    online: true, liveSimulation: true, updatedAt: new Date().toISOString()
+    online: true, liveSimulation: true, adjustments: [], updatedAt: new Date().toISOString()
   }
+}
+/** 给旧版本数据补齐现场排程字段：计划时长默认取下一场计划开始的间隔 */
+function migrate(state: DeskState): DeskState {
+  if (!Array.isArray(state.sessions) || !state.sessions.length) return state
+  const ordered = sortedSessions(state.sessions)
+  ordered.forEach((session, index) => {
+    if (typeof session.durationMinutes !== 'number') {
+      const next = ordered[index + 1]
+      session.durationMinutes = next ? Math.max(5, toMinutes(next.time) - toMinutes(session.time)) : 30
+    }
+    const legacy = session as unknown as Partial<Session>
+    if (legacy.isBreak === undefined) session.isBreak = false
+    if (legacy.locked === undefined) session.locked = false
+    if (legacy.liveStart === undefined) session.liveStart = null
+    if (legacy.liveEnd === undefined) session.liveEnd = null
+  })
+  if (!Array.isArray(state.adjustments)) state.adjustments = []
+  return state
 }
 function clone<T>(value: T): T { return structuredClone(value) }
 function loadState(): DeskState {
   if (typeof localStorage === 'undefined') return demoState()
   try {
     const saved = localStorage.getItem(STORAGE_KEY)
-    return saved ? { ...demoState(), ...JSON.parse(saved), online: navigator.onLine } : demoState()
+    if (!saved) return demoState()
+    const merged = { ...demoState(), ...JSON.parse(saved), online: navigator.onLine }
+    return migrate(merged)
   } catch { return demoState() }
 }
 const history: DeskState[] = []
@@ -86,9 +111,81 @@ export function addSpeaker() {
 }
 export function updateSpeaker(id: string, patch: Partial<Speaker>) { commit(state => { const item = state.speakers.find(row => row.id === id); if (item) Object.assign(item, patch) }) }
 export function addSession() {
-  commit(state => state.sessions.push({ id: `se-${Date.now()}`, order: Math.max(0, ...state.sessions.map(item => item.order)) + 1, time: '11:30', title: '新演讲', speakerId: state.speakers[0]?.id || '', room: '主会场 A', status: 'upcoming' }))
+  commit(state => {
+    const ordered = sortedSessions(state.sessions)
+    const last = ordered.at(-1)
+    const time = last ? liveEnd(last, ordered) : '11:30'
+    state.sessions.push({ id: `se-${Date.now()}`, order: Math.max(0, ...state.sessions.map(item => item.order)) + 1, time, durationMinutes: 30, title: '新演讲', speakerId: state.speakers[0]?.id || '', room: '主会场 A', status: 'upcoming', isBreak: false, locked: false, liveStart: null, liveEnd: null })
+  })
 }
 export function updateSession(id: string, patch: Partial<Session>) { commit(state => { const item = state.sessions.find(row => row.id === id); if (item) Object.assign(item, patch) }) }
+
+/**
+ * 现场登记某场实际结束时刻：该场标为已结束，随后未开始的场次按实际时刻重排，
+ * 遇午休/锁定场次停止并记录被挡住的安排；同时保留一条可复查的调整留痕。
+ */
+export function recordActualEnd(sessionId: string, actualEnd: string) {
+  commit(state => {
+    const ordered = sortedSessions(state.sessions)
+    const anchor = ordered.find(item => item.id === sessionId)
+    if (!anchor) return
+
+    if (!anchor.liveStart) anchor.liveStart = anchor.time
+    anchor.liveEnd = actualEnd
+    anchor.status = 'done'
+
+    const result = reschedule(ordered, sessionId, actualEnd)
+
+    // 紧跟在锚点后的第一个普通场次自动进入“进行中”，便于现场继续登记
+    const anchorIndex = ordered.findIndex(item => item.id === sessionId)
+    const nextSession = ordered.slice(anchorIndex + 1).find(item => !item.isBreak)
+    if (nextSession && !result.blockedIds.includes(nextSession.id)) nextSession.status = 'live'
+
+    const shifted = result.shifted.map(shift => ({
+      id: shift.id,
+      title: ordered.find(item => item.id === shift.id)?.title || '',
+      liveStart: shift.liveStart,
+      liveEnd: shift.liveEnd
+    }))
+    const blocker = result.blockerId ? ordered.find(item => item.id === result.blockerId) : null
+    const blocked = result.blockedIds.map(id => {
+      const item = ordered.find(row => row.id === id)!
+      return { id, title: item.isBreak ? `${item.title}（固定休息）` : item.title, plannedStart: item.time }
+    })
+    const delta = diffMinutes(plannedEnd(anchor), actualEnd)
+    const adjustment: ScheduleAdjustment = {
+      id: `adj-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      createdAt: new Date().toISOString(),
+      anchorSessionId: anchor.id,
+      anchorTitle: anchor.title,
+      actualEnd,
+      plannedEnd: plannedEnd(anchor),
+      deltaMinutes: delta,
+      blockerSessionId: blocker?.id || null,
+      blockerTitle: blocker ? (blocker.isBreak ? `${blocker.title}（固定休息）` : blocker.title) : null,
+      blockerIsBreak: blocker?.isBreak || false,
+      overflowMinutes: result.overflowMinutes,
+      shifted,
+      blocked
+    }
+    state.adjustments.push(adjustment)
+    if (state.adjustments.length > 40) state.adjustments = state.adjustments.slice(-40)
+  })
+}
+
+/** 放弃全部现场顺延，未开始场次的预计时间恢复为原计划；已结束场次的真实结束作为现场事实保留 */
+export function resetSchedule() {
+  commit(state => {
+    state.sessions.forEach(session => {
+      if (session.status !== 'done') {
+        session.liveStart = null
+        session.liveEnd = null
+      }
+    })
+    state.adjustments = []
+  })
+}
+
 export function addTerm() { commit(state => state.terms.push({ id: `term-${Date.now()}`, source: 'new term', target: '新术语', note: '', speakerId: state.speakers[0]?.id || '', priority: 'normal' })) }
 export function updateTerm(id: string, patch: Partial<Term>) { commit(state => { const item = state.terms.find(row => row.id === id); if (item) Object.assign(item, patch) }) }
 export function addAnnouncement(text: string, level: Announcement['level']) {
@@ -127,7 +224,7 @@ export function ingestCue(text: string, options: { manual?: boolean; speakerId?:
   commit(state => {
     const existing = state.cues.filter(item => item.text !== trimmed)
     const duplicate = findDuplicate(trimmed, existing)
-    const speakerId = options.speakerId || state.sessions.find(item => item.status === 'live')?.speakerId || state.speakers[0]?.id || ''
+    const speakerId = options.speakerId || state.sessions.find(item => item.status === 'live' && !item.isBreak)?.speakerId || state.speakers[0]?.id || ''
     const receivedAt = options.receivedAt || Date.now()
     const cue: Cue = {
       id: `cue-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, speakerId, text: trimmed, receivedAt,
